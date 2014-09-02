@@ -7,6 +7,7 @@ import math as m
 import cmath as cm
 from wignerpy._wignerpy import wigner3j, wigner3jvec
 from boost import spharm, spbessel
+from Bulm import compute_Bulm
 from random import random
 import healpy as hp
 import healpy.pixelfunc as hpf
@@ -28,11 +29,16 @@ def stoc(spher):
 	[r,theta,phi]=spher
 	return np.array([r*m.cos(phi)*m.sin(theta),r*m.sin(theta)*m.sin(phi),r*m.cos(theta)])
 
+def rotatez_matrix(t):
+	return np.array([[m.cos(t),-m.sin(t),0],[m.sin(t),m.cos(t),0],[0,0,1]])
+
 def rotatez(dirlist,t):
 	[theta,phi] = dirlist
 	rm = np.array([[m.cos(t),-m.sin(t),0],[m.sin(t),m.cos(t),0],[0,0,1]])
 	return ctos(rm.dot(stoc([1,theta,phi])))[1:3]
 
+def rotatey_matrix(t):
+	return np.array([[m.cos(t),0,m.sin(t)],[0,1,0],[-m.sin(t),0,m.cos(t)]])
 
 def rotatey(dirlist,t):
 	[theta,phi] = dirlist
@@ -51,7 +57,13 @@ def rotationalMatrix(phi,theta,xi):
 def rotation(theta,phi,eulerlist):
 	return ctos(rotationalMatrix(eulerlist[0],eulerlist[1],eulerlist[2]).dot(stoc([1,theta,phi])))[1:3]
 
-
+def rotate_healpixmap(healpixmap, z1, y1, z2):#the three rotation angles are (fixed rotation axes and right hand convention): rotate around z axis by z1, around y axis by y1, and z axis again by z2. I think they form a set of Euler angles, but not exactly sure.
+    nside = int((len(healpixmap)/12.)**.5)
+    if len(healpixmap)%12 != 0 or 12*(nside**2) != len(healpixmap):
+        raise Exception('ERROR: Input healpixmap length %i is not 12*nside**2!'%len(healpixmap))
+    newmapcoords_in_oldcoords = [rotatez(rotatey(rotatez(hpf.pix2ang(nside, i), -z2), -y1), -z1) for i in range(12*nside**2)]
+    newmap = [hpf.get_interp_val(healpixmap, coord[0], coord[1]) for coord in newmapcoords_in_oldcoords]
+    return newmap
 #############################################
 #spherical special functions
 ##############################################
@@ -83,10 +95,27 @@ def get_alm(skymap,lmax=4,dtheta=pi/nside,dphi=2*pi/nside):
 class Visibility_Simulator:
 	def __init__(self):
 		self.Blm = np.zeros([3,3],'complex')
-		self.initial_zenith=np.array([0, 45.336111/180.0*pi])     #at t=0, the position of zenith in equatorial coordinate in ra dec radians
+		self.initial_zenith = np.array([1000, 1000])     #at t=0, the position of zenith in equatorial coordinate in ra dec radians
+
+	def import_beam(self, beam_healpix_hor):#import beam in horizontal coord in a healpix list and rotate it according to initial_zenith
+		if self.initial_zenith.tolist() == [1000, 1000]:
+			raise Exception('ERROR: need to set self.initial_zenith first, which is at t=0, the position of zenith in equatorial coordinate in ra dec radians.')
+		beamequ_heal = rotate_healpixmap(beam_healpix_hor, 0, np.pi/2 - self.initial_zenith[1], self.initial_zenith[0])
+		self.Blm = expand_real_alm(convert_healpy_alm(hp.sphtfunc.map2alm(beamequ_heal), int(3 * (len(beamequ_heal)/12)**.5 - 1)))
+
+	def calculate_Bulm(self, L, freq, d, L1, verbose = False):
+		Blm = np.zeros((L1+1, 2*L1+1), dtype='complex64')
+		for lm in self.Blm:
+			Blm[lm] = self.Blm[lm]
+		Bulmarray = compute_Bulm(Blm, L, freq, d, L1)
+		Bulmdic = {}
+		for l in range(L+1):
+			for m in range(-l,l+1):
+				Bulmdic[(l,m)] = Bulmarray[(l,m)]
+		return Bulmdic
 
 	#from Bulm, return Bulm with given frequency(wave vector k) and baseline vector
-	def calculate_Bulm(self, L, freq, d, L1, verbose = False):    #L= lmax  , L1=l1max
+	def calculate_Bulm_old(self, L, freq, d, L1, verbose = False):    #L= lmax  , L1=l1max, takes d in equatorial coord
 		k = 2*pi*freq/299.792458
 		timer = time.time()
 
@@ -96,33 +125,25 @@ class Visibility_Simulator:
 		if verbose:
 			print "Tabulizing spherical harmonics...", dth, dph
 			sys.stdout.flush()
-		spheharray = np.zeros([L+L1+1,2*(L+L1)+1],'complex')
+		spheharray = np.zeros([L+L1+1,2*(L+L1)+1],'complex64')
 		for i in range(0,L+L1+1):
 			tmp = spbessel(i, -k*la.norm(d)) * (1.j)**i
+			#print pi, freq, la.norm(d), i, spbessel(i, -k*la.norm(d))
 			for mm in range(-i,i+1):
 				spheharray[i, mm]=(spharm(i,mm,dth,dph)).conjugate() * tmp
+				#print spheharray[i, mm]
+
 		if verbose:
 			print "Done", float(time.time() - timer)/60
 			sys.stdout.flush()
 
-		##an array of spherical Bessel functions
-		#if verbose:
-			#print "Tabulizing spherical bessel j..."
-			#sys.stdout.flush()
-		#sphjarray = np.zeros(L+L1+1,'complex')
-		#for l in range(L+L1+1):
-			#sphjarray[l] = sphj(l, -k*la.norm(d))
-
-		#if verbose:
-			#print "Done", float(time.time() - timer)/60
-			#sys.stdout.flush()
-
 		#an array of m.sqrt((2*l+1)*(2*l1+1)*(2*l2+1)/(4*pi))
-		sqrtarray = np.zeros([L+1,L1+1,L+L1+1],'complex')
+		sqrtarray = np.zeros([L+1,L1+1,L+L1+1],'float32')
 		for i in range(L+1):
 			for j in range(L1+1):
 				for kk in range(0,L+L1+1):
 					sqrtarray[i, j, kk] = m.sqrt((2*i+1)*(2*j+1)*(2*kk+1)/(4*pi))
+					#print i,j,kk,sqrtarray[i, j, kk]
 		if verbose:
 			print float(time.time() - timer)/60
 			sys.stdout.flush()
@@ -143,24 +164,20 @@ class Visibility_Simulator:
 
 						delta = 0
 						for l2 in range(l2min,l+l1+1):
-							#if self.Blm[(l1,mm1)] ==0 :
-								#Bulm[(l,mm)] += 0
-							#else:
-								#if l == 26 and mm == -26 and l1 == 5 and mm1 == -1:
-									#print 4*pi*(-1)**mm * (1j**l2)*sphjarray[l2]*spheharray[l2, mm2]*self.Blm[(l1,mm1)]*sqrtarray[l, l1, l2]*wignerarray0[diff+l2-l2min]*wignerarray[l2-l2min],
-									##print wigner3jvec(l,l1,0,0)
-									##print diff+l2-l2min, diff, l2, l2min
-									#print l2, mm2, (spheh(l2, mm2,ctos(d)[1],ctos(d)[2])).conjugate(), spheharray[l2, mm2]
-									#print l2, (1j**l2), sphjarray[l2], self.Blm[(l1,mm1)], spheharray[l2, mm2], sqrtarray[l, l1, l2], wignerarray0[diff+l2-l2min], (-1)**mm, wignerarray[l2-l2min]
-								delta += spheharray[l2, mm2]*sqrtarray[l, l1, l2]*wignerarray0[diff+l2-l2min]*wignerarray[l2-l2min]#(1j**l2)*sphjarray[l2]*
+							delta += spheharray[l2, mm2]*sqrtarray[l, l1, l2]*wignerarray0[diff+l2-l2min]*wignerarray[l2-l2min]#(1j**l2)*sphjarray[l2]*
+							#print l,mm,l1,mm1,l2,sqrtarray[l, l1, l2]*wignerarray0[diff+l2-l2min]*wignerarray[l2-l2min],spheharray[l2, mm2], delta, self.Blm[l1,mm1]
+						#print delta, self.Blm[(l1,mm1)], delta * self.Blm[l1,mm1], Bulm[(l,mm)],
 						Bulm[(l,mm)] += delta * self.Blm[l1,mm1]
+						#print Bulm[(l,mm)]
+				#print l, mm, Bulm[(l,mm)]
 				Bulm[(l,mm)] = 4*pi*(-1)**mm * Bulm[(l,mm)]
+				#print l, mm, Bulm[(l,mm)]
 		if verbose:
 			print float(time.time() - timer)/60
 			sys.stdout.flush()
 		return Bulm
 
-	def calculate_visibility(self, skymap_alm, d, freq, L, nt = None, tlist = None, verbose = False):
+	def calculate_visibility(self, skymap_alm, d, freq, L, nt = None, tlist = None, verbose = False):#d in horizontal coord
 		##rotate d to equatorial coordinate
 		drotate = stoc(np.append(la.norm(d),rotatez(rotatey(ctos(d)[1:3], (np.pi/2 - self.initial_zenith[1])), self.initial_zenith[0])))
 		if verbose:
